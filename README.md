@@ -42,9 +42,9 @@ This directory contains master templates, sub-templates and other resources that
 ## Additional Notes
 ### AmazonLinux2023 support in the MarkLogic CloudFormation Templates:
 
-Starting with MarkLogic 11.3.1 (combined), the MarkLogic CloudFormation Templates support AmazonLinux2023 OS type along with AmazonLinux2. Select the AmazonLinux2023 value from OSType parameter to create MarkLogic cluster with this new OS.
+Starting with MarkLogic 11.3.1 (combined), the MarkLogic CloudFormation Template supports both Amazon Linux 2023 and Amazon Linux 2. Select the "AmazonLinux2023" value from "OSType" parameter to create MarkLogic cluster using the AL2023 AMI.
 
-MarkLogic installation on AL2023 instances will have no support for GPU computing. Note that the manual installation of CUDA-related drivers will still not enable MarkLogic to leverage the GPU devices in the machine. Support to leverage GPU devices will be included in a future release.
+MarkLogic on AL2023 does not support GPU devices. Any use of the embedded ONNX libraries will be executed using the host’s CPU. Support for GPUs on AL2023 is being investigated for a future release of MarkLogic Server.
 
 ### AWS Classic Load Balancer Removed from Single Zone Deployments:
 
