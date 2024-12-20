@@ -40,6 +40,12 @@ This directory contains master templates, sub-templates and other resources that
 - [MarkLogic on AWS](https://developer.marklogic.com/products/cloud/aws)  
 
 ## Additional Notes
+### AmazonLinux2023 support in the MarkLogic CloudFormation Templates:
+
+Starting with MarkLogic 11.3.1 (combined), the MarkLogic CloudFormation Templates support AmazonLinux2023 OS type along with AmazonLinux2. Select the AmazonLinux2023 value from OSType parameter to create MarkLogic cluster with this new OS.
+
+MarkLogic installation on AL2023 instances will have no support for GPU computing. Note that the manual installation of CUDA-related drivers will still not enable MarkLogic to leverage the GPU devices in the machine. Support to leverage GPU devices will be included in a future release.
+
 ### AWS Classic Load Balancer Removed from Single Zone Deployments:
 
 Since AWS is retiring the Classic Load Balancer (CLB) as of August 15, 2022, the CLB has been removed for single-zone deployments in the MarkLogic CloudFormation templates. The URL in the outputs of the CloudFormation stack is now replaced with a private DNS name, which can be used to access the MarkLogic cluster.
