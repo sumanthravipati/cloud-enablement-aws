@@ -42,7 +42,7 @@ This directory contains master templates, sub-templates and other resources that
 ## Additional Notes
 ### AmazonLinux2023 support in the MarkLogic CloudFormation Templates:
 
-Starting with MarkLogic 11.3.1 (combined), the MarkLogic CloudFormation Template supports both Amazon Linux 2023 and Amazon Linux 2. Select the "AmazonLinux2023" value from "OSType" parameter to create MarkLogic cluster using the AL2023 AMI.
+Starting with MarkLogic 11.3.1 (combined), the MarkLogic CloudFormation Template supports both Amazon Linux 2023 and Amazon Linux 2. Select the "AmazonLinux2023" value from "OSType" parameter to create MarkLogic cluster using the AL2023 AMI. The default value for the "OSType" parameter is "AmazonLinux2023".
 
 MarkLogic on AL2023 does not support GPU devices. Any use of the embedded ONNX libraries will be executed using the host’s CPU. Support for GPUs on AL2023 is being investigated for a future release of MarkLogic Server.
 
