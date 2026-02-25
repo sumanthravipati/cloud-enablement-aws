@@ -1883,3 +1883,30 @@ Outputs:
       - - 'http://'
         - !If [MultiZone, !GetAtt [Alb, DNSName], !GetAtt [ManagedEniStack, Outputs.ENI]]
         - ':8001'
+  ClusterEndpoint:
+    Description: The endpoint URL for the MarkLogic Cluster (DNS name or IP) - Primary endpoint only
+    Value: !If 
+      - MultiZone
+      - !GetAtt [Alb, DNSName]
+      - !Select 
+        - 0
+        - !Split 
+          - ','
+          - !GetAtt [ManagedEniStack, Outputs.ENI]
+    Export:
+      Name: !Sub ${AWS::StackName}-ClusterEndpoint
+  AdminUsername:
+    Description: MarkLogic Admin Username
+    Value: !Ref AdminUser
+    Export:
+      Name: !Sub ${AWS::StackName}-AdminUser
+  SecurityGroupId:
+    Description: Security Group ID for Lambda VPC access
+    Value: !Ref InstanceSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-SecurityGroup
+  PrivateSubnet1Id:
+    Description: Private Subnet 1 ID for Lambda VPC access
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnet1

@@ -1,0 +1,384 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: MarkLogic Group Manager
+Metadata:
+  version: 12.0.1
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Group Manager Configuration'
+        Parameters:
+          - ParentStackName
+          - GroupNames
+          - AdminPass
+    ParameterLabels:
+      ParentStackName:
+        default: MarkLogic Cluster Parent Stack Name
+      GroupNames:
+        default: Group Names
+      AdminPass:
+        default: Admin Password
+Parameters:
+  ParentStackName:
+    Description: Name of the MarkLogic cluster parent stack
+    Type: String
+  GroupNames:
+    Description: Comma-separated list of group names (e.g., enode,dnode,fnode)
+    Type: CommaDelimitedList
+  AdminPass:
+    Description: The MarkLogic administrator password
+    Type: String
+    NoEcho: 'true'
+    AllowedPattern: >-
+      ^(?!.*[*]).*$
+    ConstraintDescription: Admin password must contain any characters except asterisk (*).
+
+Resources:
+  GroupManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+
+  GroupManagerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: GroupManagerRole
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt GroupManagerRole.Arn
+      Timeout: 180
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub ${ParentStackName}-SecurityGroup
+        SubnetIds:
+          - Fn::ImportValue: !Sub ${ParentStackName}-PrivateSubnet1
+      Environment:
+        Variables:
+          CLUSTER_ENDPOINT:
+            Fn::ImportValue: !Sub ${ParentStackName}-ClusterEndpoint
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import urllib3
+          import base64
+          import time
+          import hashlib
+          import re
+          from typing import List, Set, Optional
+          
+          http = urllib3.PoolManager()
+          
+          def validate_group_name(name: str) -> bool:
+              """Validate MarkLogic group name"""
+              pattern = r'^[a-zA-Z0-9_-]+$'
+              return bool(re.match(pattern, name)) and len(name) <= 64
+          
+          def handler(event, context):
+              print(f"Event: {json.dumps(event, default=str)}")
+              
+              request_type = event['RequestType']
+              properties = event['ResourceProperties']
+              old_properties = event.get('OldResourceProperties', {})
+              
+              group_names = properties['GroupNames']
+              old_group_names = old_properties.get('GroupNames', [])
+              
+              # Convert to lists if not already
+              if not isinstance(group_names, list):
+                  group_names = [group_names]
+              if not isinstance(old_group_names, list):
+                  old_group_names = [old_group_names]
+              
+              # Validate group names
+              for name in group_names:
+                  if not validate_group_name(name):
+                      return send_response(event, context, 'FAILED', 
+                          f"Invalid group name '{name}'. Only alphanumeric, dash, underscore allowed (max 64 chars)")
+              
+              print(f"Request Type: {request_type}")
+              print(f"Current Groups: {group_names}")
+              print(f"Old Groups: {old_group_names}")
+              
+              try:
+                  if request_type == 'Create':
+                      handle_create(properties, group_names)
+                  elif request_type == 'Update':
+                      handle_update(properties, group_names, old_group_names)
+                  elif request_type == 'Delete':
+                      handle_delete(properties, group_names)
+                  
+                  return send_response(event, context, 'SUCCESS', 
+                      f'Groups managed: {request_type}')
+              except Exception as e:
+                  print(f"ERROR: {str(e)}")
+                  import traceback
+                  traceback.print_exc()
+                  return send_response(event, context, 'FAILED', str(e))
+          
+          def digest_auth_request(method: str, url: str, username: str, password: str, 
+                                  payload: Optional[dict] = None):
+              """Make request with HTTP Digest Authentication"""
+              body = json.dumps(payload) if payload else None
+              
+              response = http.request(method, url, body=body, timeout=30.0)
+              
+              if response.status != 401:
+                  return response
+              
+              www_auth = response.headers.get('WWW-Authenticate', '')
+              
+              if 'Digest' in www_auth:
+                  realm = re.search(r'realm="([^"]+)"', www_auth)
+                  nonce = re.search(r'nonce="([^"]+)"', www_auth)
+                  
+                  if realm and nonce:
+                      realm_val = realm.group(1)
+                      nonce_val = nonce.group(1)
+                      
+                      uri = '/' + url.split('/', 3)[-1]
+                      ha1 = hashlib.md5(f"{username}:{realm_val}:{password}".encode()).hexdigest()
+                      ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()
+                      digest_resp = hashlib.md5(f"{ha1}:{nonce_val}:{ha2}".encode()).hexdigest()
+                      
+                      auth_header = (
+                          f'Digest username="{username}", realm="{realm_val}", '
+                          f'nonce="{nonce_val}", uri="{uri}", response="{digest_resp}"'
+                      )
+                      
+                      headers = {
+                          'Authorization': auth_header,
+                          'Content-Type': 'application/json',
+                          'Accept': 'application/json'
+                      }
+                      
+                      return http.request(method, url, body=body, headers=headers, timeout=30.0)
+              
+              auth_string = base64.b64encode(f"{username}:{password}".encode()).decode()
+              headers = {
+                  'Authorization': f'Basic {auth_string}',
+                  'Content-Type': 'application/json',
+                  'Accept': 'application/json'
+              }
+              
+              return http.request(method, url, body=body, headers=headers, timeout=30.0)
+          
+          def wait_for_ready(endpoint: str, username: str, password: str):
+              """Wait for MarkLogic to be ready"""
+              url = f"http://{endpoint}:8002/manage/v2"
+              
+              for attempt in range(1, 21):
+                  try:
+                      response = digest_auth_request('GET', url, username, password)
+                      if response.status in [200, 401]:
+                          print(f"✓ Ready (attempt {attempt})")
+                          time.sleep(5)
+                          return
+                  except Exception as e:
+                      print(f"Attempt {attempt}: {str(e)[:80]}")
+                  
+                  time.sleep(15)
+              
+              raise Exception("Not ready after 5 minutes")
+          
+          def get_groups(endpoint: str, username: str, password: str) -> Set[str]:
+              """Get existing groups from MarkLogic"""
+              url = f"http://{endpoint}:8002/manage/v2/groups?format=json"
+              response = digest_auth_request('GET', url, username, password)
+              
+              if response.status != 200:
+                  print(f"Failed to get groups: {response.status}")
+                  return set()
+              
+              data = json.loads(response.data.decode('utf-8'))
+              groups = data.get('group-default-list', {}).get('list-items', {}).get('list-item', [])
+              
+              if isinstance(groups, dict):
+                  groups = [groups]
+              
+              group_names = {g['nameref'] for g in groups if 'nameref' in g}
+              print(f"Existing groups in MarkLogic: {group_names}")
+              return group_names
+          
+          def create_group(endpoint: str, username: str, password: str, name: str):
+              """Create a group"""
+              url = f"http://{endpoint}:8002/manage/v2/groups"
+              payload = {"group-name": name}
+              
+              response = digest_auth_request('POST', url, username, password, payload)
+              
+              if response.status not in [200, 201]:
+                  raise Exception(f"Failed to create '{name}': {response.status}")
+              
+              print(f"✓ Created: {name}")
+          
+          def delete_group(endpoint: str, username: str, password: str, name: str):
+              """Delete a group with better error handling"""
+              if name == 'Default':
+                  print(f"⚠ Skipping protected group: {name}")
+                  return
+              
+              url = f"http://{endpoint}:8002/manage/v2/groups/{name}"
+              response = digest_auth_request('DELETE', url, username, password)
+              
+              if response.status in [200, 204]:
+                  print(f"✓ Deleted: {name}")
+              elif response.status == 404:
+                  print(f"⚠ Not found: {name}")
+              elif response.status == 400:
+                  # Group may have assigned hosts
+                  print(f"⚠ Cannot delete '{name}' - may have assigned hosts or other dependencies")
+              else:
+                  print(f"⚠ Delete failed for {name}: {response.status}")
+          
+          def handle_create(properties, desired: List[str]):
+              """Handle CREATE - create all desired groups"""
+              endpoint = os.environ['CLUSTER_ENDPOINT']  # Changed: Use helper function
+              username = properties['AdminUser']
+              password = properties['AdminPass']
+              
+              print(f"Endpoint: {endpoint}")
+              wait_for_ready(endpoint, username, password)
+              
+              # Get what already exists in MarkLogic
+              existing = get_groups(endpoint, username, password)
+              desired_set = set(desired)
+              protected = {'Default'}
+              
+              # Create only groups that don't exist and aren't protected
+              to_create = desired_set - existing - protected
+              
+              print(f"CREATE: Desired={desired_set}, Existing={existing}, ToCreate={to_create}")
+              
+              for name in to_create:
+                  create_group(endpoint, username, password, name)
+              
+              print(f"✓ CREATE complete: {len(to_create)} group(s) created")
+          
+          def handle_update(properties, desired: List[str], old: List[str]):
+              """
+              Handle UPDATE - compare desired vs old, create/delete accordingly
+              
+              Logic:
+              1. Groups in desired but not in old -> CREATE
+              2. Groups in old but not in desired -> DELETE  
+              3. Groups in both -> KEEP (no action)
+              """
+              endpoint = os.environ['CLUSTER_ENDPOINT']  # Changed: Use helper function
+              username = properties['AdminUser']
+              password = properties['AdminPass']
+              
+              wait_for_ready(endpoint, username, password)
+              
+              # Convert to sets for comparison
+              desired_set = set(desired)
+              old_set = set(old)
+              protected = {'Default'}
+              
+              # Calculate changes
+              to_create = desired_set - old_set  # New groups to add
+              to_delete = (old_set - desired_set) - protected  # Groups to remove (except protected)
+              to_keep = desired_set & old_set  # Groups that remain
+              
+              print(f"UPDATE Analysis:")
+              print(f"  Old groups:     {old_set}")
+              print(f"  Desired groups: {desired_set}")
+              print(f"  To CREATE:      {to_create}")
+              print(f"  To DELETE:      {to_delete}")
+              print(f"  To KEEP:        {to_keep}")
+              
+              # Verify against actual MarkLogic state
+              existing_in_ml = get_groups(endpoint, username, password)
+              print(f"  Actual in ML:   {existing_in_ml}")
+              
+              # Delete groups first
+              for name in to_delete:
+                  delete_group(endpoint, username, password, name)
+              
+              # Create new groups
+              for name in to_create:
+                  # Only create if it doesn't already exist
+                  if name not in existing_in_ml:
+                      create_group(endpoint, username, password, name)
+                  else:
+                      print(f"⚠ Group '{name}' already exists, skipping")
+              
+              print(f"✓ UPDATE complete: Created={len(to_create)}, Deleted={len(to_delete)}, Kept={len(to_keep)}")
+          
+          def handle_delete(properties, groups: List[str]):
+              """Handle DELETE - remove all managed groups"""
+              try:
+                  endpoint = os.environ['CLUSTER_ENDPOINT']  # Changed: Use helper function
+                  username = properties['AdminUser']
+                  password = properties['AdminPass']
+                  
+                  print(f"DELETE: Removing groups: {groups}")
+                  
+                  for name in groups:
+                      delete_group(endpoint, username, password, name)
+                  
+                  print("✓ DELETE complete")
+              except Exception as e:
+                  print(f"Error during DELETE: {e}")
+                  # Don't fail stack deletion if cleanup fails
+          
+          def send_response(event, context, status, reason):
+              """Send CloudFormation response"""
+              # CRITICAL FIX: Use stable PhysicalResourceId
+              # Use the StackId + LogicalResourceId so it stays the same across updates
+              physical_id = event.get('PhysicalResourceId')
+              if not physical_id:
+                  # First time (Create): Generate stable ID
+                  physical_id = f"{event['StackId']}/{event['LogicalResourceId']}"
+              
+              response_body = {
+                  'Status': status,
+                  'Reason': reason,
+                  'PhysicalResourceId': physical_id,  # ← Use stable ID
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId']
+              }
+              
+              print(f"CF Response: {status} - {reason}")
+              print(f"Physical Resource ID: {physical_id}")
+              print(f"Response URL: {event['ResponseURL'][:60]}...")
+              
+              try:
+                  start = time.time()
+                  http.request('PUT', event['ResponseURL'], 
+                              body=json.dumps(response_body),
+                              headers={'Content-Type': ''},
+                              timeout=5.0)
+                  elapsed = time.time() - start
+                  print(f"✓ Response sent in {elapsed:.2f}s")
+              except Exception as e:
+                  print(f"⚠ FAILED to send response: {e}")
+                  raise
+              
+              return response_body
+
+  GroupManagerResource:
+    Type: Custom::GroupManager
+    DependsOn: GroupManagerFunction
+    Properties:
+      ServiceToken: !GetAtt GroupManagerFunction.Arn
+      GroupNames: !Ref GroupNames
+      AdminUser:
+        Fn::ImportValue: !Sub ${ParentStackName}-AdminUser
+      AdminPass: !Ref AdminPass
+
+Outputs:
+  LambdaFunctionArn:
+    Value: !GetAtt GroupManagerFunction.Arn
+  
+  ManagedGroups:
+    Value: !Join [',', !Ref GroupNames]
